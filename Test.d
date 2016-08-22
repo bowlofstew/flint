@@ -3,7 +3,76 @@
 // @author Andrei Alexandrescu (andrei.alexandrescu@facebook.com)
 
 import std.array, std.conv, std.exception, std.random, std.stdio;
-import Checks, Tokenizer;
+import Checks, Tokenizer, FileCategories;
+
+unittest {
+  EXPECT_EQ(FileCategory.header, getFileCategory("foo.h"));
+  EXPECT_EQ(FileCategory.header, getFileCategory("baz/bar/foo.h"));
+  EXPECT_EQ(FileCategory.inl_header, getFileCategory("foo-inl.h"));
+  EXPECT_EQ(FileCategory.source_cpp, getFileCategory("foo.cpp"));
+  EXPECT_EQ(FileCategory.source_c, getFileCategory("foo.c"));
+  EXPECT_EQ(FileCategory.unknown, getFileCategory("foo"));
+
+  assert(isHeader("foo.h"));
+  assert(!isHeader("foo.cpp"));
+  assert(!isHeader("foo.c"));
+
+  assert(!isSource("foo.h"));
+  assert(isSource("foo.cpp"));
+  assert(isSource("foo.c"));
+
+  assert(!isTestFile("foo.h"));
+  assert(isTestFile("testFoo.h"));
+  assert(isTestFile("/test/foo.h"));
+
+  EXPECT_EQ("foo", getFileNameBase("foo.h"));
+  EXPECT_EQ("foo", getFileNameBase("foo.cpp"));
+  EXPECT_EQ("foo", getFileNameBase("foo.c"));
+}
+
+unittest {
+  string s = "
+int main()
+  __attribute__((foo))
+
+  // Two on one line:
+  __attribute__ ((foo)) __attribute__((foo))
+
+  // Two parameters:
+  __attribute__ ( ( foo, bar ) )
+
+  // Here, we ding only the 'format' keyword.
+  __attribute__((format (printf, 1, 2)))
+
+  // Here, now with the proper __format__, we ding the format
+  // sub-type, 'printf':
+  __attribute__((__format__ (printf, 1, 2)))
+
+  // This one is fine.
+  __attribute__((__format__ (__printf__, 1, 2)))
+{
+}
+";
+  auto tokens = tokenize(s, "nofile.cpp");
+  EXPECT_EQ(checkAttributeArgumentUnderscores("nofile.cpp", tokens), 6);
+}
+
+unittest {
+  string s = "
+#include <string>
+// Some code does this, (good!), and someday we may want to exempt
+// such usage from this lint rule.
+#define strncpy(d,s,n) do_not_use_this_function
+int main() {
+  // Using strncpy(a,b,c) in a comment does not provoke a warning.
+  char buf[10];
+  strncpy(buf, \"foo\", 3);
+  return 0;
+}
+";
+  auto tokens = tokenize(s, "nofile.cpp");
+  EXPECT_EQ(checkBlacklistedIdentifiers("nofile.cpp", tokens), 2);
+}
 
 unittest {
   string s = "
@@ -264,7 +333,6 @@ unittest {
 int main(int argc, char** argv) {
   auto p = strtok(argv[0], ',');
   while ((p = strtok(nullptr, ','))) {
-    sleep(1);
   }
 }
 )";
@@ -276,7 +344,6 @@ int main(int argc, char** argv) {
   char* state;
   auto p = strtok_r(argv[0], ',', &state);
   while ((p = strtok_r(nullptr, ',', &state))) {
-    sleep(1);
   }
 }
 )";
@@ -548,13 +615,13 @@ struct BB {
 };
 ";
   tokens = tokenize(code);
-  assert(checkImplicitCast(filename, tokens) == 1);
+  assert(checkImplicitCast(filename, tokens) == 0);
 
   // It's ok to delete an implicit bool operator.
   code = "(
 class AA {
-  /* implicit */ operator bool() = delete;
-  /* implicit */ operator bool() const = delete;
+  operator bool() = delete;
+  operator bool() const = delete;
 };
 )";
   tokens = tokenize(code);
@@ -815,7 +882,7 @@ class BB {
 void EXPECT_EQ(T, U, string f = __FILE__, size_t n = __LINE__)
     (auto ref T lhs, auto ref U rhs) {
   if (lhs == rhs) return;
-  stderr.writeln(text(f, "(", n, "): ", lhs, " != ", rhs));
+  stderr.writeln(text(f, ":", n, ": ", lhs, " != ", rhs));
   assert(0);
 }
 
@@ -944,20 +1011,20 @@ void qux() {
   EXPECT_EQ(checkUsingDirectives(filename, tokens), 0);
 
   string s1 = "
-namespace facebook {
+  namespace facebook {
 
-  namespace { void unnamed(); }
-  namespace fs = boost::filesystem;
+    namespace { void unnamed(); }
+    namespace fs = boost::filesystem;
 
-  void foo() { }
-  using namespace not_ok;
-  namespace whatever {
+    void foo() { }
     using namespace not_ok;
-    namespace facebook {
+    namespace whatever {
+      using namespace warn;
+      namespace facebook {
+      }
     }
   }
-}
-using namespace not_ok;
+  using namespace not_ok;
 ";
   tokens = tokenize(s1);
   EXPECT_EQ(checkUsingDirectives(filename, tokens), 4);
@@ -968,6 +1035,46 @@ void foo() {
 }";
   tokens = tokenize(s2);
   EXPECT_EQ(checkUsingDirectives(filename, tokens), 0);
+}
+
+// test that we allow 'using x=y::z; but not 'using abc::def'
+unittest {
+  string s1 = "
+    using not_ok::nope;
+    using not_ok::nope::stillnotok;
+    using SomeAlias1 = is::ok;
+    using SomeAlias2 = is::ok::cool;
+  ";
+  string filename = "nofile.h";
+  auto tokens = tokenize(s1);
+  EXPECT_EQ(checkUsingDirectives(filename, tokens), 2);
+
+  string s2 = "
+    void foo() { using is::ok; }
+    namespace facebook {
+      using not_ok::nope;
+      using alias3 = is::ok;
+    }";
+  auto tokens2 = tokenize(s2);
+  EXPECT_EQ(checkUsingDirectives(filename, tokens2), 1);
+
+  string s3 = "
+    namespace notfacebook {
+      using is::warn;
+      using namespace warn;
+    }";
+  auto tokens3 = tokenize(s3);
+  EXPECT_EQ(checkUsingDirectives(filename, tokens3), 2);
+
+  string s4 = "
+    /* using override */ using ok::good;
+    /* using override */ using namespace ok;
+    namespace facebook {
+      /* using override */ using ok::good;
+    }";
+
+  auto tokens4 = tokenize(s4);
+  EXPECT_EQ(checkUsingDirectives(filename, tokens4), 0);
 }
 
 // testCheckUsingNamespaceDirectives
@@ -983,8 +1090,14 @@ unittest {
   string nothing = "";
   RUN_THIS_TEST(nothing, 0);
 
-  string simple = "using namespace std;";
-  RUN_THIS_TEST(simple, 0);
+  string simple1 = "using namespace std;";
+  RUN_THIS_TEST(simple1, 0);
+
+  string simple2 = "using ok::good;";
+  RUN_THIS_TEST(simple2, 0);
+
+  string simple3 = "using alias = ok::good;";
+  RUN_THIS_TEST(simple3, 0);
 
   string simpleFail = "
 using namespace std;
@@ -2062,6 +2175,16 @@ int main() {
 ";
   tokenize(s16, filename, tokens);
   EXPECT_EQ(checkUniquePtrUsage(filename, tokens), 0);
+
+  string s17 = "
+int main() {
+  unique_ptr<const volatile char*[]> p(
+    new const volatile char*[1]
+  );
+}
+";
+  tokenize(s17, filename, tokens);
+  EXPECT_EQ(checkUniquePtrUsage(filename, tokens), 0);
 }
 
 // testThreadSpecificPtr
@@ -2174,23 +2297,50 @@ unittest {
     "#include \"random/unsafe/in/oss\"\n"
     "#include \"oss-is-safe\" // nolint\n"
     "#include \"oss/is/safe\" // nolint\n"
-    "#include \"configerator/structs/is/for/proxygen\"\n"
     "#include \"oss-at-eof-should-be-safe\" // nolint";
 
   import std.typecons;
   Tuple!(string, int)[] filenamesAndErrors = [
     tuple("anyfile.cpp", 0),
     tuple("non-oss-project/anyfile.cpp", 0),
-    tuple("folly/anyfile.cpp", 4),
-    tuple("hphp/anyfile.cpp", 2),
+    tuple("folly/anyfile.cpp", 3),
+    tuple("hphp/anyfile.cpp", 1),
     tuple("hphp/facebook/anyfile.cpp", 0),
-    tuple("ti/proxygen/lib/anyfile.cpp", 3),
+    tuple("proxygen/lib/anyfile.cpp", 3),
   ];
 
   foreach (ref p; filenamesAndErrors) {
     Token[] tokens;
     tokenize(s, p[0], tokens);
     EXPECT_EQ(p[1], checkOSSIncludes(p[0], tokens));
+  }
+}
+
+// testMultipleIncludes
+
+unittest {
+  import std.typecons;
+  Tuple!(string, int)[] includesAndErrors = [
+    tuple("#include <single_file>\n"
+          "#include <includedTwice>\n"
+          "#include <includedTwice>\n", 1),
+    tuple("#include <single_file>\n"
+          "#include \"includedTwice\"\n"
+          "#include \"includedTwice\"\n", 1),
+    tuple("#include <includedTwice>\n"
+          "include \"includedTwice\"\n", 0),
+    tuple("#include <firstInclude>\n"
+          "#include <secondInclude>\n", 0),
+    tuple("#include <includedTwice>\n"
+          "#include <includedTwice> /* nolint */\n", 0)
+  ];
+
+  foreach (ref p; includesAndErrors) {
+    Token[] tokens;
+    tokenize(p[0], "testFile.cpp", tokens);
+    EXPECT_EQ(p[1], checkMultipleIncludes("testFile.cpp", tokens));
+    tokenize(p[0], "testFile.c", tokens);
+    EXPECT_EQ(p[1], checkMultipleIncludes("testFile.c", tokens));
   }
 }
 
@@ -2317,34 +2467,98 @@ unittest {
   tokens.clear();
   tokenize(s3, filename, tokens);
   EXPECT_EQ(checkRandomUsage(filename, tokens), 1);
+
+  // std::random_shuffle
+  string s4 = "
+    random_shuffle(x, y, z);
+  ";
+  tokens.clear();
+  tokenize(s4, filename, tokens);
+  EXPECT_EQ(checkRandomUsage(filename, tokens), 1);
 }
 
-// testCheckToDoFollowedByTaskNumber
-version(facebook) {
+// testCheckSleepUsage
+unittest {
+  string filename = "testFile.cpp";
+  Token[] tokens;
+
+  // sleep
+  string s = "
+    sleep(1);
+    //Nothing
+    sleep(5);
+  ";
+  tokenize(s, filename, tokens);
+  EXPECT_EQ(checkSleepUsage(filename, tokens), 2);
+
+  // usleep()
+  string s1 = "
+    usleep(200);
+  ";
+  tokens.clear();
+  tokenize(s1, filename, tokens);
+  EXPECT_EQ(checkSleepUsage(filename, tokens), 1);
+
+  // sleep_for
+  string s2 = "
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+  ";
+  tokens.clear();
+  tokenize(s2, filename, tokens);
+  EXPECT_EQ(checkSleepUsage(filename, tokens), 1);
+
+  // sleep_until
+  string s3 = "
+    this_thread::sleep_until(chrono::system_clock::now());
+  ";
+  tokens.clear();
+  tokenize(s3, filename, tokens);
+  EXPECT_EQ(checkSleepUsage(filename, tokens), 1);
+
+  // No false positives
+  string s4 = `
+    //sleep comment
+    sleepy_code();
+    DEFINE_int32(sleep, 0, "trolololol");
+  `;
+  tokens.clear();
+  tokenize(s4, filename, tokens);
+  EXPECT_EQ(checkSleepUsage(filename, tokens), 0);
+
+  // Override lint rule mechanism
+  // Scope test: one lint error will apply for this test (the last line).
+  stderr.writeln("-------------------------------------TESTASFASDFASDASDASD");
+  string s5 = "
+    /* sleep override */ sleep();
+    /* sleep override */ this_thread::sleep_for(std::chrono::milliseconds(200));
+    /* sleep override */ std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    /* sleep override */ appliesToThisInstead(); sleep();
+  ";
+  tokens.clear();
+  tokenize(s5, filename, tokens);
+  EXPECT_EQ(checkSleepUsage(filename, tokens), 1);
+}
+
+version(facebook)  {
   unittest {
     Token[] tokens;
-    string filename = "somefileforToDo.cpp";
+    string filename = "somefileforAngleBrackets.cpp";
 
     string s1 = "
-    // TODO (#123). This is OK.
+    #include PRECOMPILED
+    #include \"folly/Foo.h\"  // not ok
+    #include \"folly/Bar.h\"  // ok because nolint
+    #include <folly/Baz.h>    // ok because folly likes angle brackets
     ";
     tokenize(s1, filename, tokens);
-    EXPECT_EQ(checkToDoFollowedByTaskNumber(filename, tokens), 0);
 
-    string s2 = "
-    // TODO Task #1970153: It would be great if there were set()\n
-    // methods that didn't bump up the refcount so that we didn't\n
-    // have to decrement it here \n" " tvRefcountedDecRef(&value);\n
-    return arrayRefShuffle<false>(ad, retval, nullptr);
-    ";
-    tokenize(s2, filename, tokens);
-    EXPECT_EQ(checkToDoFollowedByTaskNumber(filename, tokens), 0);
+    // Only a warning if used outside of folly or thrift
+    EXPECT_EQ(checkAngleBracketIncludes(filename, tokens), 0);
 
-    string s3 = "
-    // TODO (#)
-    ";
-    tokenize(s3, filename, tokens);
-    EXPECT_EQ(checkToDoFollowedByTaskNumber(filename, tokens), 1);
+    filename = "thrift/somefileForAngleBrackets.cpp";
+    tokenize(s1, filename, tokens);
+
+    EXPECT_EQ(checkAngleBracketIncludes(filename, tokens), 1);
   }
 }
 
@@ -2376,6 +2590,40 @@ unittest {
   EXPECT_EQ(checkConstructors(filename, tokens), 0);
 }
 
+// testCheckExitStatus
+unittest {
+  string code = "
+    exit(-1);
+  ";
+  string filename = "nofile.cpp";
+  auto tokens = tokenize(code, filename);
+  EXPECT_EQ(checkExitStatus(filename, tokens), 1);
+  code = "
+    _exit(-1);
+  ";
+  tokens = tokenize(code, filename);
+  EXPECT_EQ(checkExitStatus(filename, tokens), 1);
+  code = "
+    ::exit(-1);
+  ";
+  tokens = tokenize(code, filename);
+  EXPECT_EQ(checkExitStatus(filename, tokens), 1);
+  code = "
+    _exit(EXIT_FAILURE);
+  ";
+  tokens = tokenize(code, filename);
+  EXPECT_EQ(checkExitStatus(filename, tokens), 0);
+  code = "
+    _exit(0);
+  ";
+  tokens = tokenize(code, filename);
+  EXPECT_EQ(checkExitStatus(filename, tokens), 0);
+  code = "
+    validFunction(-1);
+  ";
+  tokens = tokenize(code, filename);
+  EXPECT_EQ(checkExitStatus(filename, tokens), 0);
+}
 
 void main(string[] args) {
   enforce(c_mode == false);

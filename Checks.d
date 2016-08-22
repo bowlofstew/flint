@@ -24,16 +24,18 @@ enum explicitThrowSpec = "/* may throw */";
  */
 
 void lintError(CppLexer.Token tok, const string error) {
-  stderr.writef("%.*s(%u): %s",
+  stderr.writef("%.*s:%u: %s",
                 cast(uint) tok.file_.length, tok.file_,
                 cast(uint) tok.line_,
                 error);
 }
 
+immutable string warningPrefix = "Warning: ";
+
 void lintWarning(CppLexer.Token tok, const string warning) {
   // The FbcodeCppLinter just looks for the text "Warning" in the
   // message.
-  lintError(tok, "Warning: " ~ warning);
+  lintError(tok, warningPrefix ~ warning);
 }
 
 void lintAdvice(CppLexer.Token tok, string advice) {
@@ -57,9 +59,65 @@ string getSucceedingWhitespace(Token[] v) {
   return v[1].precedingWhitespace_;
 }
 
-// Remove the double quotes or <'s from an included path.
-string getIncludedPath(string p) {
-  return p[1 .. p.length - 1];
+bool isInMacro(Token[] v, const long idx) {
+  // Walk backwards through the tokens, continuing until a newline
+  // that is not preceded by a backslash is encountered (i.e. a
+  // true line break).
+  for (long i = idx; i >= 0; --i) {
+    if (v[i..$].atSequence(tk!"#", tk!"identifier") &&
+        v[i + 1].value == "define") return true;
+    if (i == 0) return false;
+    string pws = v[i].precedingWhitespace_;
+    auto pos = lastIndexOf(pws, '\n');
+    if (pos == -1) continue;
+    if (pos != 0) return false;
+    if (v[i - 1].type_ != tk!"\\") return false;
+  }
+  return false;
+}
+
+struct IncludedPath {
+  string path;
+  bool angleBrackets;
+  bool nolint;
+  bool precompiled;
+}
+
+bool getIncludedPath(R)(ref R r, out IncludedPath ipath) {
+  if (!r.atSequence(tk!"#", tk!"identifier") || r[1].value != "include") {
+    return false;
+  }
+
+  r.popFrontN(2);
+  bool found = false;
+  if (r.front.value_ == "PRECOMPILED") {
+    ipath.precompiled = true;
+    found = true;
+  }
+
+  if (r.front.type_ == tk!"string_literal") {
+    string val = r.front.value;
+    ipath.path = val[1 .. val.length - 1];
+    found = true;
+  } else if (r.front.type_ == tk!"<") {
+    r.popFront;
+    ipath.path = "";
+    for (; !r.empty; r.popFront) {
+      if (r.front.type_ == tk!">") {
+        break;
+      }
+      ipath.path ~= r.front.value;
+    }
+    ipath.angleBrackets = true;
+    found = true;
+  }
+
+  if (!found) {
+    return false;
+  }
+
+  ipath.nolint = getSucceedingWhitespace(r).canFind("nolint");
+  return true;
 }
 
 /*
@@ -122,9 +180,10 @@ R skipTemplateSpec(R)(R r, bool* containsArray = null) {
       continue;
     }
     if (r.front.type_ == tk!">>") {
-      assert(angleNest >= 2);
+      // it is possible to munch a template from within a template, so we
+      // only want to consume one of the '>>'
       angleNest -= 2;
-      if (angleNest == 0) break;
+      if (angleNest <= 0) break;
       continue;
     }
   }
@@ -261,6 +320,7 @@ struct FunctionSpec {
   bool explicitThrows;
   bool isConst;
   bool isDeleted;
+  bool isDefault;
 };
 
 string formatArg(Argument arg) {
@@ -393,6 +453,11 @@ bool getFunctionSpec(ref Token[] r, ref FunctionSpec spec) {
         r2.popFront;
         continue;
       }
+      if (r2.front.type_ == tk!"default") {
+        spec.isDefault = true;
+        r2.popFront;
+        continue;
+      }
     }
     break;
   }
@@ -465,6 +530,7 @@ uint checkBlacklistedSequences(string fpath, CppLexer.Token[] v) {
       if (!atSequence(v[i .. $], entry.tokens)) { continue; }
       if (isException) { isException = false; continue; }
       if (c_mode && entry.cpponly == true) { continue; }
+      if (v[i].precedingWhitespace_.canFind("nolint")) { continue; }
       lintWarning(v[i], entry.descr);
       ++result;
     }
@@ -473,13 +539,16 @@ uint checkBlacklistedSequences(string fpath, CppLexer.Token[] v) {
   return result;
 }
 
-uint checkBlacklistedIdentifiers(const string fpath, const CppLexer.Token[] v) {
+uint checkBlacklistedIdentifiers(string fpath, CppLexer.Token[] v) {
   uint result = 0;
 
   string[string] banned = [
     "strtok" :
       "strtok() is not thread safe, and has safer alternatives.  Consider "
-      "folly::split or strtok_r as appropriate.\n"
+      "folly::split or strtok_r as appropriate.\n",
+    "strncpy" :
+      "strncpy is very often used in error; see "
+      "http://meyering.net/crusade-to-eliminate-strncpy/\n"
   ];
 
   foreach (ref t; v) {
@@ -520,6 +589,7 @@ uint checkDefinedNames(string fpath, Token[] v) {
   foreach (i, ref t; v) {
     if (i == 0 || v[i - 1].type_ != tk!"#" || t.type_ != tk!"identifier"
         || t.value != "define") continue;
+    if (v[i - 1].precedingWhitespace_.canFind("nolint")) continue;
     const t1 = v[i + 1];
     auto const sym = t1.value_;
     if (t1.type_ != tk!"identifier") {
@@ -573,6 +643,7 @@ uint checkCatchByReference(string fpath, Token[] v) {
   uint result = 0;
   foreach (i, ref e; v) {
     if (e.type_ != tk!"catch") continue;
+    if (getSucceedingWhitespace(v[i..$]).canFind("nolint")) continue;
     size_t focal = 1;
     enforce(v[i + focal].type_ == tk!"(", // a "(" comes always after catch
         text(v[i + focal].file_, ":", v[i + focal].line_,
@@ -993,7 +1064,8 @@ uint checkConstructors(string fpath, Token[] tokensV) {
 
     // Warn about move constructors that are not noexcept
     if (isMoveConstructor &&
-        !spec.isNoexcept && !spec.explicitThrows && !spec.isDeleted) {
+        !spec.isNoexcept && !spec.explicitThrows && !spec.isDeleted &&
+        !spec.isDefault) {
       ++result;
       lintError(tox.front, text(
         "Move constructor '", formatFunction(spec),
@@ -1054,7 +1126,12 @@ uint checkImplicitCast(string fpath, Token[] tokensV) {
       continue;
     }
 
-    // Special case operator bool(), we don't want to allow over-riding
+    // Only want to process operators which do not have the overide
+    if (tox.front.type_ != tk!"operator" ||
+        tox.front.precedingWhitespace_.canFind(lintOverride)) {
+      continue;
+    }
+
     if (tox.atSequence(tk!"operator", tk!"bool", tk!"(", tk!")")) {
       if (tox[4 .. $].atSequence(tk!"=", tk!"delete") ||
           tox[4 .. $].atSequence(tk!"const", tk!"=", tk!"delete")) {
@@ -1070,12 +1147,6 @@ uint checkImplicitCast(string fpath, Token[] tokensV) {
         "function (see http://www.artima.com/cppsource/safebool.html for more "
         "details).\n"
       );
-      continue;
-    }
-
-    // Only want to process operators which do not have the overide
-    if (tox.front.type_ != tk!"operator" ||
-        tox.front.precedingWhitespace_.canFind(lintOverride)) {
       continue;
     }
 
@@ -1287,6 +1358,12 @@ uint checkIncludeGuard(string fpath, Token[] v) {
     return 0;
   }
 
+  // Allow override-include-guard
+  enum override_string = "override-include-guard";
+  if (!v.empty && v.front().precedingWhitespace_.canFind(override_string)) {
+    return 0;
+  }
+
   // Allow #pragma once
   if (v.atSequence(tk!"#", tk!"identifier", tk!"identifier")
       && v[1].value_ == "pragma" && v[2].value_ == "once") {
@@ -1300,7 +1377,11 @@ uint checkIncludeGuard(string fpath, Token[] v) {
           tk!"#", tk!"identifier", tk!"identifier")
       || v[1].value_ != "ifndef" || v[4].value_ != "define") {
     // There is no include guard in this file.
-    lintError(v.front(), "Missing include guard.\n");
+    lintError(v.front(),
+        text("Missing include guard. If you are ABSOLUTELY sure that you "
+             "don't want an include guard, then include a comment "
+             "containing ", override_string, " in lieu of an include "
+             "guard.\n"));
     return 1;
   }
 
@@ -1358,7 +1439,10 @@ uint checkUsingDirectives(string fpath, Token[] v) {
   }
   uint result = 0;
   uint openBraces = 0;
-  uint openNamespaces = 0;
+  string[] namespaceStack; // keep track of which namespace we are in
+  immutable string lintOverride = "using override";
+  immutable string lintOverrideMessage =
+    "Override this lint warning with a /* " ~ lintOverride ~ " */ comment\n";
 
   for (auto i = v; !i.empty; i.popFront) {
     if (i.front.type_ == tk!"{") {
@@ -1370,9 +1454,9 @@ uint checkUsingDirectives(string fpath, Token[] v) {
         // Closed more braces than we had.  Syntax error.
         return 0;
       }
-      if (openBraces == openNamespaces) {
+      if (openBraces == namespaceStack.length) {
         // This brace closes namespace.
-        --openNamespaces;
+        namespaceStack.length--;
       }
       --openBraces;
       continue;
@@ -1387,14 +1471,14 @@ uint checkUsingDirectives(string fpath, Token[] v) {
       // to nest namespaces inside of functions or classes here
       // (invalid C++), so we have an invalid parse and should give
       // up.
-      if (openBraces != openNamespaces) {
+      if (openBraces != namespaceStack.length) {
         return result;
       }
 
       // Introducing an actual namespace.
       if (i[1].type_ == tk!"{") {
         // Anonymous namespace, let it be. Next iteration will hit the '{'.
-        ++openNamespaces;
+        namespaceStack ~= "anonymous";
         continue;
       }
 
@@ -1415,26 +1499,48 @@ uint checkUsingDirectives(string fpath, Token[] v) {
         // Invalid parse for us.
         return result;
       }
-      ++openNamespaces;
+      namespaceStack ~= i.front.value_;
       // Continue analyzing, next iteration will hit the '{' or the '::'
       continue;
     }
     if (i.front.type_ == tk!"using") {
+
       // We're on a "using" keyword
+      auto usingTok = i.front;
       i.popFront;
-      if (i.front.type_ != tk!"namespace") {
-        // we only care about "using namespace"
+
+      if (usingTok.precedingWhitespace_.canFind(lintOverride)) {
         continue;
       }
-      if (openBraces == 0) {
-        lintError(i.front, "Using directive not allowed at top level"
-          " or inside namespace facebook.\n");
-        ++result;
-      } else if (openBraces == openNamespaces) {
-        // We are directly inside the namespace.
-        lintError(i.front, "Using directive not allowed in header file, "
-          "unless it is scoped to an inline function or function template.\n");
-        ++result;
+
+      // look for 'using namespace' or 'using x::y'
+      bool usingCompound = i.atSequence(tk!"identifier", tk!"::",
+                                        tk!"identifier");
+
+      if (!usingCompound && (i.front.type_ != tk!"namespace")) {
+        continue;
+      }
+      else {
+        string errorPrefix = usingCompound ? warningPrefix : "";
+        if (openBraces == 0) {
+          lintError(i.front, errorPrefix ~ "Using directive not allowed at top "
+                    "level or inside namespace facebook. "
+                    ~ lintOverrideMessage);
+          ++result;
+        } else if (openBraces == namespaceStack.length) {
+          // It is only an error to pollute the facebook or global namespaces,
+          // otherwise it is a warning
+          if (namespaceStack.length >= 1 && namespaceStack[$-1] != "facebook") {
+            errorPrefix = warningPrefix;
+          }
+
+          // We are directly inside the namespace.
+          lintError(i.front, errorPrefix ~ "Using directive not allowed in "
+                    "header file, unless it is scoped to an inline function "
+                    "or function template. "
+                    ~ lintOverrideMessage);
+          ++result;
+        }
       }
     }
   }
@@ -1711,7 +1817,9 @@ uint checkQuestionableIncludes(string fpath, Token[] v) {
   // to deprecate them
   const bool[string] deprecatedIncludes = [
     "common/base/Base.h":1,
+    "common/base/StlTypes.h":1,
     "common/base/StringUtil.h":1,
+    "common/base/Types.h":1,
   ];
 
   // Set storing the expensive includes. Add new headers here if you'd like
@@ -1725,14 +1833,12 @@ uint checkQuestionableIncludes(string fpath, Token[] v) {
   bool includingFileIsHeader = (getFileCategory(fpath) == FileCategory.header);
   uint result = 0;
   for (; !v.empty; v.popFront) {
-    if (!v.atSequence(tk!"#", tk!"identifier") || v[1].value != "include") {
-      continue;
-    }
-    if (v[2].type_ != tk!"string_literal" || v[2].value == "PRECOMPILED") {
+    IncludedPath ipath;
+    if (!getIncludedPath(v, ipath)) {
       continue;
     }
 
-    string includedFile = getIncludedPath(v[2].value);
+    string includedFile = ipath.path;
 
     if (includedFile in deprecatedIncludes) {
       lintWarning(v.front, text("Including deprecated header ",
@@ -1766,27 +1872,20 @@ uint checkIncludeAssociatedHeader(string fpath, Token[] v) {
   uint totalIncludesFound = 0;
 
   for (; !v.empty; v.popFront) {
-    if (!v.atSequence(tk!"#", tk!"identifier") || v[1].value != "include") {
+    IncludedPath ipath;
+    if (!getIncludedPath(v, ipath)) {
       continue;
     }
 
     // Skip PRECOMPILED #includes, or #includes followed by a 'nolint' comment
-    if (v[2].value == "PRECOMPILED") continue;
-    if (v[2].type_ == tk!"string_literal"
-        && getSucceedingWhitespace(v[2 .. $]).canFind("nolint")) continue;
-    if (v[2].type_ == tk!"<") {
-      uint i = 3;
-      for (; i < v.length; ++i) if (v[i].type_ == tk!">") break;
-      if (i < v.length
-          && getSucceedingWhitespace(v[i .. $]).canFind("nolint")) continue;
+    if (ipath.precompiled || ipath.nolint) {
+      continue;
     }
 
     ++totalIncludesFound;
-    if (v[2].type_ != tk!"string_literal") continue;
 
-    string includedFile = getIncludedPath(v[2].value).baseName;
-    string includedParentPath =
-      getIncludedPath(v[2].value_).dirName;
+    string includedFile = ipath.path.baseName;
+    string includedParentPath = ipath.path.dirName;
     if (includedParentPath == ".") includedParentPath = null;
 
     if (getFileNameBase(includedFile) == fileNameBase &&
@@ -1854,13 +1953,12 @@ uint checkInlHeaderInclusions(string fpath, Token[] v) {
   auto fileNameBase = getFileNameBase(fileName);
 
   for (; !v.empty; v.popFront) {
-    if (!v.atSequence(tk!"#", tk!"identifier", tk!"string_literal")
-        || v[1].value_ != "include") {
+    IncludedPath ipath;
+    if (!getIncludedPath(v, ipath)) {
       continue;
     }
-    v.popFrontN(2);
 
-    auto includedPath = getIncludedPath(v.front.value_);
+    auto includedPath = ipath.path;
     if (getFileCategory(includedPath) != FileCategory.inl_header) {
       continue;
     }
@@ -2082,7 +2180,7 @@ uint checkUniquePtrUsage(string fpath, Token[] v) {
     if (i.front.type_ == tk!"\0") {
       return result;
     }
-    assert(i.front.type_ == tk!">");
+    assert(i.front.type_ == tk!">" || i.front.type_ == tk!">>");
     i.popFront;
 
     /*
@@ -2114,6 +2212,9 @@ uint checkUniquePtrUsage(string fpath, Token[] v) {
 
       // We're looking at the new expression we care about.  Try to
       // ensure it has array brackets only if the unique_ptr type did.
+      while (i.front.type_.among(tk!"const", tk!"volatile")) {
+        i.popFront;
+      }
       while (i.front.type_ == tk!"identifier" || i.front.type_ == tk!"::") {
         i.popFront;
       }
@@ -2260,7 +2361,9 @@ uint checkBannedIdentifiers(string fpath, Token[] v) {
  * harmful (generates unnecessary code in each TU). Find more information
  * here: https://our.intern.facebook.com/intern/tasks/?t=2435344
 */
-uint checkNamespaceScopedStatics(string fpath, Token[] v) {
+uint checkNamespaceScopedStatics(string fpath, Token[] w) {
+  auto v = w;
+
   if (!isHeader(fpath)) {
     // This check only looks at headers. Inside .cpp files, knock
     // yourself out.
@@ -2281,10 +2384,12 @@ uint checkNamespaceScopedStatics(string fpath, Token[] v) {
       // which are interesting for this rule.
       v = skipBlock(v);
     } else if (v.front.type_ == tk!"static") {
-      lintWarning(v.front,
-                  "Avoid using static at global or namespace scope "
-                  "in C++ header files.\n");
-      ++result;
+      if (!isInMacro(w, w.length - v.length)) {
+        lintWarning(v.front,
+                    "Avoid using static at global or namespace scope "
+                    "in C++ header files.\n");
+        ++result;
+      }
     }
   }
 
@@ -2332,34 +2437,55 @@ uint checkIncludes(
   uint result = 0;
 
   // Find all occurrences of '#include "..."'. Ignore '#include <...>', since
-  // <...> is not used for fbcode includes.
+  // <...> is not used for fbcode includes except to include other OSS
+  // projects.
   for (auto it = v; !it.empty; it.popFront) {
-    if (it.atSequence(tk!"#", tk!"identifier", tk!"string_literal")
-        && it[1].value_ == "include") {
-      it.popFrontN(2);
-      auto includePath = it.front.value_[1 .. $-1];
+    IncludedPath ipath;
+    if (!getIncludedPath(it, ipath) || ipath.angleBrackets || ipath.nolint) {
+      continue;
+    }
 
-      // Includes from other projects always contain a '/'.
-      auto slash = includePath.findSplitBefore("/");
-      if (slash[1].empty) continue;
+    auto includePath = ipath.path;
 
-      // If this prefix is allowed, continue
-      if (allowedPrefixes.any!(x => includePath.startsWith(x))) continue;
+    // Includes from other projects always contain a '/'.
+    auto slash = includePath.findSplitBefore("/");
+    if (slash[1].empty) continue;
 
-      // If the include is followed by the comment 'nolint' then it is ok.
-      auto nit = it.save;
-      nit.popFront; // Do not increment 'it' - increment a copy.
-      if (nit.empty || nit.front.precedingWhitespace_.canFind("nolint")) {
-        continue;
-      }
+    // If this prefix is allowed, continue
+    if (allowedPrefixes.any!(x => includePath.startsWith(x))) continue;
 
-      // Finally, the lint error.
-      fn(it.front, "Open Source Software may not include files from "
-          "other fbcode projects (except what's already open-sourced). "
-          "If this is not an fbcode include, please use "
-          "'#include <...>' instead of '#include \"...\"'. "
-          "You may suppress this warning by including the "
-          "comment 'nolint' after the #include \"...\".\n");
+    // Finally, the lint error.
+    fn(it.front, "Open Source Software may not include files from "
+        "other fbcode projects (except what's already open-sourced). "
+        "If this is not an fbcode include, please use "
+        "'#include <...>' instead of '#include \"...\"'. "
+        "You may suppress this warning by including the "
+        "comment 'nolint' after the #include \"...\".\n");
+    ++result;
+  }
+  return result;
+}
+
+/*
+ * Lint check: prevent multiple includes of the same file
+ */
+uint checkMultipleIncludes(string fpath, Token[] v) {
+  uint result = 0;
+  bool[string] pathSet;
+  for (auto it = v; !it.empty; it.popFront) {
+    IncludedPath ipath;
+    if (!getIncludedPath(it, ipath) || ipath.nolint) {
+      continue;
+    }
+
+    auto includePath = ipath.path;
+    if (includePath !in pathSet) {
+      pathSet[includePath] = true;
+    } else {
+      lintError(it.front, text("\"", includePath, "\" is included multiple ",
+          "times. Please remove one of the #includes.\nTo suppress this ",
+          "lint error, add the comment 'nolint' at the end of the include ",
+          "line.\n"));
       ++result;
     }
   }
@@ -2379,11 +2505,19 @@ uint checkOSSIncludes(string fpath, Token[] v) {
   import std.typecons;
   Tuple!(string, string[], Fn)[] projects = [
     tuple("folly/", ["folly/"], &lintError),
-    tuple("hphp/", ["hphp/", "folly/"], &lintError),
+    tuple("mcrouter/", ["mcrouter/", "folly/"], &lintError),
+    tuple("hphp/",
+          ["hphp/", "folly/", "thrift/", "proxygen/lib/",
+           "mcrouter/", "squangle/"],
+          &lintError),
     tuple("thrift/", ["thrift/", "folly/"], &lintError),
-    tuple("ti/proxygen/lib/",
-          ["ti/proxygen/lib/", "folly/", "thrift/", "configerator/structs/"],
-          &lintWarning),
+    tuple("squangle/", ["squangle/", "folly/", "thrift/"], &lintError),
+    tuple("proxygen/lib/",
+          ["proxygen/lib/", "folly/"],
+          &lintError),
+    tuple("proxygen/httpserver/",
+          ["proxygen/httpserver/", "proxygen/lib/", "folly/"],
+          &lintError),
   ];
 
   foreach (ref p; projects) {
@@ -2443,7 +2577,10 @@ uint checkBreakInSynchronized(string fpath, Token[] v) {
   StatementBlockInfo[] nestedStatements;
 
   for (Token[] tox = v; !tox.empty; tox.popFront) {
-    if (tox.front.type_.among(tk!"while", tk!"switch", tk!"do", tk!"for")) {
+    if (tox.front.type_.among(tk!"while", tk!"switch", tk!"do", tk!"for")
+        || (tox.front.type_ == tk!"identifier"
+        && tox.front.value_.among("FOR_EACH_KV", "FOR_EACH", "FOR_EACH_R",
+                                  "FOR_EACH_ENUMERATE"))) {
       StatementBlockInfo s;
       s.name = tox.front.value_;
       s.openBraces = 0;
@@ -2516,15 +2653,19 @@ uint checkRandomUsage(string fpath, Token[] v) {
   uint result = 0;
 
   string[string] random_banned = [
-    "random_device":
+    "random_device" :
       "random_device uses /dev/urandom, which is expensive. "
-      "Use follly::Random::rand32 or other methods in folly/Random.h.\n",
+      "Use folly::Random::rand32 or other methods in folly/Random.h.\n",
     "RandomInt32" :
       "using RandomInt32 (in common/base/Random.h) to generate random number "
       "is discouraged, please consider folly::Random::rand32().\n",
     "RandomInt64" :
       "using RandomInt64 (in common/base/Random.h) to generate random number "
-      "is discouraged, please consider folly::Random::rand64().\n"
+      "is discouraged, please consider folly::Random::rand64().\n",
+    "random_shuffle" :
+      "std::random_shuffle is bankrupt (see http://fburl.com/evilrand) and is "
+      "scheduled for removal from C++17. Please consider the overload of"
+      "std::shuffle that takes a random # generator."
   ];
 
   for (; !v.empty; v.popFront) {
@@ -2534,7 +2675,7 @@ uint checkRandomUsage(string fpath, Token[] v) {
     if (!mapIt) {
       if (v.atSequence(tk!"identifier", tk!"(", tk!")")
             && t.value_ == "rand") {
-          lintError(
+          lintWarning(
             t,
             "using C rand() to generate random number causes lock contention, "
             "please consider folly::Random::rand32().\n");
@@ -2542,13 +2683,74 @@ uint checkRandomUsage(string fpath, Token[] v) {
       }
       continue;
     }
-    lintError(t, *mapIt);
+    lintWarning(t, *mapIt);
     ++result;
   }
 
   return result;
 }
 
+/*
+ * Lint check: sleep and sleep-like functions.
+ * Sleep calls are rarely actually the solution to your problems
+ * and accordingly, warrant explanation.
+ */
+uint checkSleepUsage(string fpath, Token[] v) {
+  uint result = 0;
+
+  immutable string lintOverride = "sleep override";
+  immutable string message = "Most sleep calls are inappropriate. "
+    "Sleep calls are especially harmful in test cases, whereby they make the "
+    "tests, and by extension, contbuild, flakey. In general, the correctness "
+    "of a program should not depend on its execution speed.\n"
+    "Consider condition variables and/or futures as a replacement "
+    "(see http://fburl.com/SleepsToFuturesDex)."
+    "\n\nOverride lint rule by preceding the call with a /* sleep override */"
+    "comment.";
+  byte[string] sleepBanned = [
+    "sleep" : true,
+    "usleep" : true,
+  ];
+  immutable sequence = [ tk!"identifier", tk!"::", tk!"identifier" ];
+  immutable sequenceWithStd = [ tk!"identifier", tk!"::" ].idup ~ sequence;
+  bool hasBannedSequenceIdentifiers(const(Token)[] v) {
+    return v.length >= 4 && v[0].value_ == "this_thread"
+        && (v[2].value_ == "sleep_for" || v[2].value_ == "sleep_until")
+        && v[3].type_ == tk!"(";
+  }
+
+  for (; !v.empty; v.popFront) {
+    auto t = v.front;
+    if (t.type_ != tk!"identifier") {
+      continue;
+    }
+    auto matched = t.value_ in sleepBanned
+                   && v.length >= 2 && v[1].type_ == tk!"(";
+    if (!matched) {
+      if (!v.atSequence(sequence)) {
+        continue;
+      }
+      auto sequenceStart = v;
+      if (v.atSequence(sequenceWithStd)) {
+        sequenceStart = v[2 .. $];
+      }
+      if (!hasBannedSequenceIdentifiers(sequenceStart)) {
+        continue;
+      }
+      //No double jeopardy when we look past std::
+      v = sequenceStart;
+    }
+    stderr.writeln("----------------", t, " Whitespace: ", t.precedingWhitespace_);
+    if (t.precedingWhitespace_.canFind(lintOverride)) {
+      continue;
+    }
+
+    lintWarning(t, message);
+    ++result;
+  }
+
+  return result;
+}
 
 /**
  * Checks that the proper C++11 headers are directly (i.e. non-transitively)
@@ -3149,56 +3351,106 @@ uint checkBogusComparisons(string fpath, Token[] v) {
   return inequalityBogusComparisons + equalityBogusComparisons;
 }
 
-/*
- * Check if comments containing the word
- * If 'TODO' is found in the comment,
- * then a task number should be in the same line.
- * find more info at:
- * https://our.intern.facebook.com/intern/tasks/?t=4405141
- * https://our.intern.facebook.com/intern/tasks/?t=4064698
-*/
+
 version(facebook) {
-  uint checkToDoFollowedByTaskNumber(string fpath, Token[] v) {
-    uint result = 0;
-    string kToDo = "TODO";
+  immutable string[] angleBracketErrorDirs = [
+    "folly/", "thrift/", "proxygen/lib", "proxygen/httpserver"
+  ];
+  immutable string[] angleBracketRequiredPrefixes = [
+    "folly/", "thrift/lib/", "proxygen/lib", "proxygen/httpserver"
+  ];
 
-    for (auto it = v; !it.empty; it.popFront) {
-      string comment = it.front.precedingWhitespace_;
-      size_t pos = 0;
-      while (true) {
-        // Find the position of "TODO" from position pos.
-        auto posToDo = std.string.indexOf(comment[pos .. $], kToDo);
-        // If no instance of "TODO" is found, just return
-        // the current result.
-        if (posToDo < 0) {
-          break;
-        }
-        posToDo += pos;
+  uint checkAngleBracketIncludes(string fpath, Token[] v) {
+    // strip fpath of '.../fbcode/', if present
+    auto ppath = fpath.findSplitAfter("/fbcode/")[1];
+    bool isError = angleBracketErrorDirs.any!(x => ppath.startsWith(x));
+    auto errorFunc = isError ? &lintError : &lintWarning;
 
-        // If an instance of "TODO" was found, then try to find the
-        // following task number (XXXXXX) in the same line.
-        // Try to find the end of the line first.
-        auto posEndLine = std.string.indexOf(
-          comment[posToDo + kToDo.length .. $], '\n');
-        // if no new line mark is found, reaches the end of the comment.
-        if (posEndLine < 0) {
-          posEndLine = comment.length-1;
-        }
-        else {
-          posEndLine += posToDo + kToDo.length;
-        }
+    uint errorCount = 0;
+    for (; !v.empty; v.popFront) {
+      IncludedPath ipath;
+      if (!getIncludedPath(v, ipath)) {
+        continue;
+      }
+      if (ipath.angleBrackets) {
+        continue;
+      }
 
-        // if task number doesn't exist, or task number isn't in the same line
-        // with the instance of "TODO". report it as an warning now.
-        if (countchars(comment[posToDo + kToDo.length .. posEndLine],
-                     "0-9") == 0) {
-          lintWarning(it.front(), "Missing task number after 'TODO'.\n");
-          ++result;
+      if (angleBracketRequiredPrefixes.any!(x => ipath.path.startsWith(x))) {
+        errorFunc(v.front, text(
+            "#include \"", ipath.path, "\" must use angle brackets\n"));
+        if (isError) {
+          errorCount += 1;
         }
-
-        pos = posEndLine+1;
+        break;
       }
     }
-    return result;
+
+    return errorCount;
   }
+}
+
+/**
+  * Lint check: exit(-1) (or any other negative exit code) makes no sense
+  * We should at least use exit(EXIT_FAILURE) instead
+  */
+uint checkExitStatus(string fpath, Token[] v) {
+  uint result = 0;
+  bool[string] exitFunctions = ["exit":true, "_exit":true];
+  for (auto tox = v; !tox.empty; tox.popFront) {
+    if (tox.atSequence(tk!"identifier", tk!"(", tk!"-", tk!"number", tk!")")) {
+      if (tox[0].value !in exitFunctions) {
+        continue;
+      }
+      lintWarning(tox[3], text(
+          "exit(-",
+          tox[3].value_,
+          ") is not well-defined; use exit(EXIT_FAILURE) instead.\n"));
+      ++result;
+    }
+  }
+
+  return result;
+}
+
+/**
+  * Lint check: the argument(s) of __attribute__((...)) should have the
+  * form __KEYWORD__, i.e., with leading and trailing "__".
+  * Otherwise, especially in header files, the unadorned keyword
+  * impinges on the user/application-code namespace.
+  */
+uint checkAttributeArgumentUnderscores(string fpath, Token[] v) {
+  uint result = 0;
+  for (auto tok = v; !tok.empty; tok.popFront) {
+    /* First, detect "__attribute__((T", where T does not start with "__". */
+    if (!tok.atSequence(tk!"identifier", tk!"(", tk!"(", tk!"identifier")
+        || tok[0].value != "__attribute__") {
+      continue;
+    }
+    auto kw = tok[3];
+    if (!kw.value.startsWith("__")) {
+      lintWarning(kw, format("__attribute__ type \"%s\""
+                             " should be written as \"__%s__\"\n",
+                             kw.value_, kw.value_));
+      ++result;
+    }
+
+    /* Pop off the 4 tokens we've just recognized. */
+    tok.popFrontN(4);
+
+    if (kw.value != "__format__") {
+      continue;
+    }
+
+    /* Also detect when the T in "__format__(T" does not start with "__". */
+    if (tok.atSequence(tk!"(", tk!"identifier")
+        && !tok[1].value.startsWith("__")) {
+      lintWarning(tok[1], format("__attribute__ format archetype \"%s\""
+                                 " should be written as \"__%s__\"\n",
+                                 tok[1].value_, tok[1].value_));
+      ++result;
+    }
+  }
+
+  return result;
 }
